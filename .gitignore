@@ -1,0 +1,117 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage / type check caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# =========================
+# Local env / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# GCP deploy local env
+deploy/gcp/cloudrun.env
+deploy/gcp/*.local.env
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+airflow_logs/
+tmp/
+temp/
+
+# =========================
+# Local ML / generated artifacts
+# =========================
+mlruns/
+artifacts/
+outputs/
+reports/
+
+# Local model files
+*.pkl
+*.joblib
+*.bin
+*.model
+
+# =========================
+# Data artifacts
+# =========================
+data/raw/
+data/processed/
+feature_repo/data/
+
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!feature_repo/data/.gitkeep
+
+# =========================
+# Airflow local state
+# =========================
+airflow_home/
+airflow/
+*.pid
+
+# =========================
+# Streamlit / UI local state
+# =========================
+.streamlit/secrets.toml
+
+# =========================
+# Docker / local runtime leftovers
+# =========================
+docker-data/
+*.sqlite
+*.db
+*.db-journal
+
+# =========================
+# Optional exports / archives
+# =========================
+*.zip
+*.tar
+*.tar.gz
+*.rar
+.codex/
+.codex

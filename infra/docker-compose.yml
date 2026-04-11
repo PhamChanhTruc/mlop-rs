@@ -1,0 +1,243 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+      POSTGRES_DB: mlflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  kafka:
+    image: apache/kafka:3.9.2
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,EXTERNAL://:29092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "1"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  flink-jobmanager:
+    build:
+      context: ./flink
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["jobmanager"]
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+    ports:
+      - "8081:8081"
+    volumes:
+      - ..:/opt/mlops-rs
+
+  flink-taskmanager:
+    build:
+      context: ./flink
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    command: ["taskmanager"]
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    volumes:
+      - ..:/opt/mlops-rs
+
+  realtime-processor:
+    build:
+      context: ./flink
+    container_name: mlops-rs-realtime-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python3", "/opt/mlops-rs/streaming/flink/realtime_feature_job.py", "--bootstrap-servers", "kafka:9092", "--topic", "user_events", "--mode", "standalone", "--partition", "0", "--auto-offset-reset", "latest", "--redis-host", "redis"]
+    restart: unless-stopped
+    volumes:
+      - ..:/opt/mlops-rs
+
+  mlflow:
+    build:
+      context: ./mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlruns:/mlruns
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  airflow:
+    build:
+      context: ./airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+      AIRFLOW__CORE__DAGS_FOLDER: "/opt/airflow/dags"
+      # Keep Airflow metadata isolated from MLflow so each service owns its
+      # own Alembic history table.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:airflow@postgres:5432/airflow"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.session,airflow.api.auth.backend.basic_auth"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW_HOME: "/opt/airflow"
+      _AIRFLOW_WWW_USER_USERNAME: "admin"
+      _AIRFLOW_WWW_USER_PASSWORD: "admin"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MLFLOW_EXPERIMENT: "xgb-baseline-retailrocket"
+      AIRFLOW_TUNING_EXPERIMENT: "xgb-optuna-retailrocket"
+      AIRFLOW_MODEL_NAME: "xgb-baseline-retailrocket"
+      AIRFLOW_TUNED_MODEL_NAME: "xgb-optuna-retailrocket"
+      AIRFLOW_MODEL_ARTIFACT_PATH: "model"
+      AIRFLOW_TUNED_MODEL_ARTIFACT_PATH: "best_model_train_val"
+      AIRFLOW_ENABLE_OPTUNA_TUNING: "${AIRFLOW_ENABLE_OPTUNA_TUNING:-false}"
+      AIRFLOW_OPTUNA_TRIALS: "${AIRFLOW_OPTUNA_TRIALS:-30}"
+      AIRFLOW_PROMOTE_TUNED_IF_AVAILABLE: "${AIRFLOW_PROMOTE_TUNED_IF_AVAILABLE:-false}"
+      AIRFLOW_MIN_BASELINE_VAL_PR_AUC: "${AIRFLOW_MIN_BASELINE_VAL_PR_AUC:-0.0}"
+      AIRFLOW_MIN_TUNED_FINAL_TEST_PR_AUC: "${AIRFLOW_MIN_TUNED_FINAL_TEST_PR_AUC:-0.0}"
+    user: "${AIRFLOW_UID:-1000}:0"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ..:/opt/mlops-rs
+      - airflow_home:/opt/airflow
+    command: ["bash", "-lc", "airflow db migrate && airflow standalone"]
+
+  api:
+    build:
+      context: ..
+      dockerfile: serving/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MLFLOW_EXPERIMENT: "xgb-baseline-retailrocket"
+      FEAST_REPO_PATH: "/app/feature_repo"
+      REALTIME_REDIS_HOST: "redis"
+      REALTIME_REDIS_PORT: "6379"
+      REALTIME_REDIS_DB: "0"
+      MODEL_URI: "models:/xgb-baseline-retailrocket/Production"
+      MODEL_ARTIFACT_PATH: "model"
+      MODEL_URI_FALLBACK_TO_LATEST_RUN: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../feature_repo:/app/feature_repo
+      - ../data:/app/data:ro
+      - mlruns:/mlruns:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  airflow_home:
+  pgdata:
+  redisdata:
+  mlruns:
+  grafana-data:
+  kafka_data:

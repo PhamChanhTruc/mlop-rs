@@ -1,0 +1,75 @@
+name: deploy-cloud-run
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcp_project_id:
+        description: "Google Cloud project ID"
+        required: true
+        type: string
+      gcp_region:
+        description: "Google Cloud region"
+        required: true
+        default: "asia-southeast1"
+        type: string
+      artifact_registry_repo:
+        description: "Artifact Registry Docker repository"
+        required: true
+        default: "mlops-rs-images"
+        type: string
+      cloud_run_service:
+        description: "Cloud Run service name"
+        required: true
+        default: "mlops-rs-inference"
+        type: string
+      image_tag:
+        description: "Image tag"
+        required: true
+        default: "latest"
+        type: string
+      model_uri:
+        description: "Model URI passed to the inference service"
+        required: true
+        default: "models:/xgb-baseline-retailrocket/Production"
+        type: string
+      mlflow_tracking_uri:
+        description: "Optional reachable MLflow tracking URI for Cloud Run"
+        required: false
+        type: string
+      mlflow_experiment:
+        description: "Optional MLflow experiment name"
+        required: false
+        default: "xgb-baseline-retailrocket"
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Deploy FastAPI service to Cloud Run
+        env:
+          GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+          GCP_REGION: ${{ inputs.gcp_region }}
+          ARTIFACT_REGISTRY_REPO: ${{ inputs.artifact_registry_repo }}
+          CLOUD_RUN_SERVICE: ${{ inputs.cloud_run_service }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          MODEL_URI: ${{ inputs.model_uri }}
+          MLFLOW_TRACKING_URI: ${{ inputs.mlflow_tracking_uri }}
+          MLFLOW_EXPERIMENT: ${{ inputs.mlflow_experiment }}
+        run: |
+          bash deploy/gcp/deploy_cloud_run.sh

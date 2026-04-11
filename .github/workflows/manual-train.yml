@@ -1,0 +1,77 @@
+name: manual-train
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_optuna:
+        description: "Also run Optuna tuning after baseline training"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      optuna_trials:
+        description: "Number of Optuna trials if tuning is enabled"
+        required: true
+        default: "10"
+        type: string
+
+jobs:
+  train-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      MLFLOW_TRACKING_URI: file:${{ github.workspace }}/mlruns
+      MLFLOW_EXPERIMENT: github-actions-thesis-demo
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r serving/requirements.txt
+          pip install psycopg2-binary
+
+      - name: Rebuild processed data and trainset
+        run: |
+          python data/scripts/preprocess_retailrocket.py
+          python data/scripts/build_trainset_retailrocket.py
+
+      - name: Train baseline model with local MLflow file tracking
+        run: |
+          python -m training.train_xgb_baseline
+
+      - name: Optionally run Optuna tuning
+        if: ${{ inputs.run_optuna == 'true' }}
+        run: |
+          python -m training.tune_xgb_optuna --n-trials "${{ inputs.optuna_trials }}" --tracking-uri "$MLFLOW_TRACKING_URI" --experiment "$MLFLOW_EXPERIMENT"
+
+      - name: Upload local MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-runs
+          path: mlruns
+          if-no-files-found: error
+
+      - name: Upload rebuilt processed datasets
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data
+          path: |
+            data/processed/events_retailrocket.parquet
+            data/processed/dataset_retailrocket
+          if-no-files-found: error
