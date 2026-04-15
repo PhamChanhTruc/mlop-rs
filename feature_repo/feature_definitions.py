@@ -51,8 +51,13 @@ def build_labeled_candidate_frame(
     ).astype(int)
     candidates["is_addtocart"] = (candidates["event_type"] == "addtocart").astype(int)
 
-    feature_columns = [feature for feature in MODEL_FEATURES if feature != "is_addtocart"]
-    candidates = candidates.join(df[feature_columns], how="left")
+    feature_columns = [
+        feature
+        for feature in MODEL_FEATURES
+        if feature != "is_addtocart" and feature not in candidates.columns
+    ]
+    if feature_columns:
+        candidates = candidates.join(df[feature_columns], how="left")
     return candidates
 
 

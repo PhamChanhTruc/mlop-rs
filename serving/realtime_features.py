@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+"""Helper utilities for reading realtime Redis-backed serving features."""
+
 import os
 from dataclasses import dataclass
 from typing import Dict, Optional

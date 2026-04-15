@@ -52,9 +52,13 @@ jobs:
             infra/airflow/dags/retailrocket_baseline_pipeline.py \
             smoke_mlflow.py
 
-      - name: Run import smoke checks
+      - name: Run import smoke checks for actual serving runtime
         run: |
-          python -c "import feature_repo.feature_definitions, feature_repo.build_online_features, training.train_xgb_baseline, training.tune_xgb_optuna, training.promote_model, serving.app, serving.realtime_app; print('core imports ok')"
+          python -c "import feature_repo.feature_definitions, feature_repo.build_online_features, training.train_xgb_baseline, training.tune_xgb_optuna, training.promote_model, serving.app; print('core imports ok')"
+
+      - name: Validate actual uvicorn runtime path
+        run: |
+          python -c "from serving.app import app; print(app.title)"
 
       - name: Check CLI help entrypoints
         run: |

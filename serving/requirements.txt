@@ -5,7 +5,7 @@ prometheus-client==0.24.1
 mlflow==3.10.0
 xgboost==3.2.0
 
-numpy==2.4.2	
+numpy==2.2.6	
 pandas<3
 pyarrow
 

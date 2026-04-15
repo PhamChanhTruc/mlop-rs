@@ -17,6 +17,12 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from serving.realtime_features import RealtimeFeatureReader
+from serving.recommendation import (
+    CandidateGenerator,
+    RecommendationCandidate,
+    resolve_recommendation_candidates,
+    resolve_recommendation_events_path,
+)
 
 try:
     from feast import FeatureStore
@@ -111,95 +117,6 @@ class RecommendRequest(BaseModel):
     is_addtocart: int = Field(default=0, ge=0, le=1)
     candidate_item_ids: Optional[List[int]] = Field(default=None, min_length=1, max_length=1000)
     candidates: Optional[List[CandidateRequest]] = Field(default=None, min_length=1, max_length=1000)
-
-
-def _resolve_recommendation_events_path() -> Path:
-    candidates = [
-        Path(RECOMMENDATION_EVENTS_PATH),
-        Path("data/processed/events_retailrocket.parquet"),
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-    checked = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        f"Candidate generation requires a processed events parquet. Checked: {checked}"
-    )
-
-
-class _CandidateGenerator:
-    def __init__(self, events_path: Path, user_recent_items: Dict[int, List[int]], popular_items: List[int]):
-        self.events_path = events_path
-        self.user_recent_items = user_recent_items
-        self.popular_items = popular_items
-
-    @classmethod
-    def from_parquet(
-        cls,
-        events_path: Path,
-        recent_days: int = 30,
-        max_user_recent_items: int = 50,
-        max_popular_items: int = 500,
-    ) -> "_CandidateGenerator":
-        events = pd.read_parquet(events_path, columns=["user_id", "item_id", "event_type", "event_ts"])
-        events["event_ts"] = pd.to_datetime(events["event_ts"], utc=True, errors="coerce")
-        events = events.dropna(subset=["user_id", "item_id", "event_ts"]).copy()
-        if events.empty:
-            raise ValueError(f"No usable events found in {events_path}")
-
-        events["user_id"] = events["user_id"].astype("int64")
-        events["item_id"] = events["item_id"].astype("int64")
-
-        sorted_events = events.sort_values("event_ts", ascending=False).copy()
-        sorted_events["event_weight"] = sorted_events["event_type"].map(
-            {"view": 1.0, "addtocart": 3.0, "transaction": 5.0}
-        ).fillna(1.0)
-
-        cutoff = sorted_events["event_ts"].max() - pd.Timedelta(days=recent_days)
-        recent_events = sorted_events[sorted_events["event_ts"] >= cutoff].copy()
-        if recent_events.empty:
-            recent_events = sorted_events
-
-        user_recent_items: Dict[int, List[int]] = {}
-        for user_id, frame in sorted_events.groupby("user_id", sort=False):
-            unique_items = frame["item_id"].drop_duplicates().head(max_user_recent_items)
-            user_recent_items[int(user_id)] = [int(item_id) for item_id in unique_items.tolist()]
-
-        popular_items = (
-            recent_events.groupby("item_id", as_index=False)["event_weight"]
-            .sum()
-            .sort_values(["event_weight", "item_id"], ascending=[False, True])
-            .head(max_popular_items)["item_id"]
-            .astype("int64")
-            .tolist()
-        )
-
-        return cls(
-            events_path=events_path,
-            user_recent_items=user_recent_items,
-            popular_items=[int(item_id) for item_id in popular_items],
-        )
-
-    def generate_for_user(self, user_id: int, top_k: int) -> List[int]:
-        pool_limit = max(top_k * 10, 50)
-        ordered: List[int] = []
-        seen = set()
-
-        for item_id in self.user_recent_items.get(int(user_id), []):
-            if item_id not in seen:
-                ordered.append(item_id)
-                seen.add(item_id)
-            if len(ordered) >= pool_limit:
-                return ordered
-
-        for item_id in self.popular_items:
-            if item_id not in seen:
-                ordered.append(item_id)
-                seen.add(item_id)
-            if len(ordered) >= pool_limit:
-                break
-
-        return ordered
 
 
 def _latest_run_model_uri() -> Optional[str]:
@@ -301,11 +218,23 @@ def _load_feature_store() -> None:
         _feature_store_error = str(exc)
 
 
+def _load_realtime_feature_reader() -> None:
+    global _realtime_feature_reader, _realtime_feature_error
+    try:
+        reader = RealtimeFeatureReader.from_env()
+        reader.ping()
+        _realtime_feature_reader = reader
+        _realtime_feature_error = None
+    except Exception as exc:
+        _realtime_feature_reader = None
+        _realtime_feature_error = str(exc)
+
+
 def _load_candidate_generator() -> None:
     global _candidate_generator, _candidate_generator_error
     try:
-        events_path = _resolve_recommendation_events_path()
-        _candidate_generator = _CandidateGenerator.from_parquet(events_path)
+        events_path = resolve_recommendation_events_path(RECOMMENDATION_EVENTS_PATH)
+        _candidate_generator = CandidateGenerator.from_parquet(events_path)
         _candidate_generator_error = None
     except Exception as exc:
         _candidate_generator = None
@@ -350,6 +279,18 @@ def _seconds_since(ts: Optional[pd.Timestamp]) -> float:
 
 def _build_manual_feature_row(payload: PredictRequest) -> Dict[str, float]:
     return {name: float(getattr(payload, name)) for name in FEATURES}
+
+
+def _build_realtime_feature_row(payload: PredictRequest) -> Dict[str, float]:
+    if payload.user_id is None or payload.item_id is None:
+        raise ValueError("user_id and item_id are required for realtime Redis retrieval")
+    if _realtime_feature_reader is None:
+        raise RuntimeError(_realtime_feature_error or "Realtime Redis feature reader is not available")
+    return _realtime_feature_reader.build_feature_row(
+        user_id=int(payload.user_id),
+        item_id=int(payload.item_id),
+        is_addtocart=int(payload.is_addtocart),
+    )
 
 
 def _build_online_feature_row(payload: PredictRequest) -> Dict[str, float]:
@@ -400,21 +341,38 @@ def _build_online_feature_row(payload: PredictRequest) -> Dict[str, float]:
 def _resolve_predict_features(payload: PredictRequest) -> tuple[Dict[str, float], str]:
     if payload.user_id is not None and payload.item_id is not None:
         try:
+            return _build_realtime_feature_row(payload), "redis_realtime"
+        except Exception as exc:
+            LOGGER.info(
+                "[features] realtime Redis lookup unavailable for user_id=%s item_id=%s: %s",
+                payload.user_id,
+                payload.item_id,
+                exc,
+            )
+        try:
             return _build_online_feature_row(payload), "feast_online"
-        except Exception:
+        except Exception as exc:
+            LOGGER.info(
+                "[features] Feast online lookup unavailable for user_id=%s item_id=%s: %s",
+                payload.user_id,
+                payload.item_id,
+                exc,
+            )
             if _payload_has_manual_features(payload):
-                return _build_manual_feature_row(payload), "request_payload_fallback"
+                return _build_manual_feature_row(payload), "manual_fallback"
             raise
 
     if _payload_has_manual_features(payload):
-        return _build_manual_feature_row(payload), "request_payload"
+        return _build_manual_feature_row(payload), "manual_fallback"
 
     raise ValueError(
-        "Provide either user_id + item_id for Feast online retrieval, or all model features in the payload"
+        "Provide either user_id + item_id for realtime Redis / Feast retrieval, or all model features in the payload"
     )
 
 
-def _candidate_to_predict_request(user_id: Optional[int], candidate: CandidateRequest) -> PredictRequest:
+def _candidate_to_predict_request(
+    user_id: Optional[int], candidate: RecommendationCandidate
+) -> PredictRequest:
     return PredictRequest(
         user_id=user_id,
         item_id=candidate.item_id,
@@ -426,44 +384,6 @@ def _candidate_to_predict_request(user_id: Optional[int], candidate: CandidateRe
         item_time_since_prev_event_sec=candidate.item_time_since_prev_event_sec,
         user_item_time_since_prev_event_sec=candidate.user_item_time_since_prev_event_sec,
     )
-
-
-def _resolve_recommend_candidates(payload: RecommendRequest) -> tuple[List[CandidateRequest], str]:
-    if payload.candidate_item_ids is not None and payload.candidates is not None:
-        raise ValueError("Provide either candidate_item_ids or candidates, not both")
-
-    if payload.candidate_item_ids is not None:
-        candidates = [
-            CandidateRequest(item_id=item_id, is_addtocart=payload.is_addtocart)
-            for item_id in payload.candidate_item_ids
-        ]
-        return candidates, "candidate_item_ids"
-
-    if payload.candidates is not None:
-        return payload.candidates, "candidates"
-
-    if payload.user_id is None:
-        raise ValueError(
-            "Provide user_id for generated candidates, or candidate_item_ids/candidates for manual candidate scoring"
-        )
-
-    if _candidate_generator is None:
-        raise RuntimeError(
-            _candidate_generator_error
-            or "Candidate generator is not available; provide candidate_item_ids or candidates explicitly"
-        )
-
-    generated_item_ids = _candidate_generator.generate_for_user(payload.user_id, payload.top_k)
-    if not generated_item_ids:
-        raise ValueError(
-            "Candidate generation returned no items; provide candidate_item_ids or candidates explicitly"
-        )
-
-    candidates = [
-        CandidateRequest(item_id=item_id, is_addtocart=payload.is_addtocart)
-        for item_id in generated_item_ids
-    ]
-    return candidates, "generated_recent_and_popular"
 
 
 def _predict_proba_values(X: pd.DataFrame) -> np.ndarray:
@@ -489,6 +409,7 @@ def _observe_output_metrics(values: np.ndarray) -> None:
 def startup_event() -> None:
     _load_model()
     _load_feature_store()
+    _load_realtime_feature_reader()
     _load_candidate_generator()
     if _model is None:
         print(f"[startup] model not loaded: {_model_load_error}")
@@ -498,6 +419,13 @@ def startup_event() -> None:
         print(f"[startup] feast feature store not loaded: {_feature_store_error}")
     else:
         print(f"[startup] feast feature store loaded from: {FEAST_REPO_PATH}")
+    if _realtime_feature_reader is None:
+        print(f"[startup] realtime feature reader not loaded: {_realtime_feature_error}")
+    else:
+        print(
+            "[startup] realtime feature reader loaded from: "
+            f"{_realtime_feature_reader.host}:{_realtime_feature_reader.port} db={_realtime_feature_reader.db}"
+        )
     if _candidate_generator is None:
         print(f"[startup] candidate generator not loaded: {_candidate_generator_error}")
     else:
@@ -532,6 +460,7 @@ def root() -> dict:
         "model_loaded": _model is not None,
         "feast_repo_path": FEAST_REPO_PATH,
         "feast_loaded": _feature_store is not None,
+        "realtime_feature_reader_loaded": _realtime_feature_reader is not None,
         "candidate_generation_loaded": _candidate_generator is not None,
     }
 
@@ -605,7 +534,20 @@ def recommend(payload: RecommendRequest) -> dict:
         )
 
     try:
-        candidates, request_mode = _resolve_recommend_candidates(payload)
+        manual_candidates = (
+            [candidate.model_dump() for candidate in payload.candidates]
+            if payload.candidates is not None
+            else None
+        )
+        candidates, request_mode = resolve_recommendation_candidates(
+            user_id=payload.user_id,
+            top_k=payload.top_k,
+            is_addtocart=payload.is_addtocart,
+            candidate_item_ids=payload.candidate_item_ids,
+            manual_candidates=manual_candidates,
+            candidate_generator=_candidate_generator,
+            candidate_generator_error=_candidate_generator_error,
+        )
 
         rows = []
         item_ids = []
@@ -651,6 +593,9 @@ def recommend(payload: RecommendRequest) -> dict:
 @app.post("/reload_model")
 def reload_model() -> dict:
     _load_model()
+    _load_feature_store()
+    _load_realtime_feature_reader()
+    _load_candidate_generator()
     if _model is None:
         raise HTTPException(status_code=500, detail={"reloaded": False, "error": _model_load_error})
     return {"reloaded": True, "model_uri_loaded": _loaded_model_uri}
@@ -659,9 +604,6 @@ def reload_model() -> dict:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8")
-
-
-
 
 
 
