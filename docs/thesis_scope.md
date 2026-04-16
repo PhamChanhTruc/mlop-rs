@@ -21,7 +21,7 @@ It should not be defended as a fully cloud-managed production platform.
 | Optuna hyperparameter tuning | Done | `training/tune_xgb_optuna.py` |
 | MLflow tracking and model promotion | Done | `training/train_xgb_baseline.py`, `training/promote_model.py` |
 | Airflow local orchestration | Done | `infra/airflow/dags/retailrocket_baseline_pipeline.py` |
-| Purchase probability serving | Done | `serving/app.py`, `serving/realtime_app.py` |
+| Purchase probability serving | Done | `serving/app.py` is the runtime entrypoint; `serving/realtime_app.py` is compatibility-only |
 | Top-N recommendation serving | Done | lightweight retrieval + ranking in `serving/recommendation.py` and `serving/app.py`; retrieval uses recent user interactions plus popular-item fallback, then ranks with the existing purchase-probability model |
 | Realtime feature refresh | Partial | Kafka to Redis path works, but via Python consumer in `streaming/flink/realtime_feature_job.py`, not a submitted Flink job |
 | Monitoring | Partial | Prometheus/Grafana cover API metrics, not full model/data quality monitoring |

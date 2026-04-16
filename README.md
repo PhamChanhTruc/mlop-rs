@@ -66,6 +66,12 @@ Future work:
 - `ui/`: Streamlit demo UI for the FastAPI service
 - `docs/`: focused architecture and thesis-scope notes
 
+## Dependency Files
+
+- `serving/requirements.txt`: serving/runtime dependencies for FastAPI inference, online feature lookup, and monitoring
+- `requirements-training.txt`: shared training/tuning dependencies for `training/train_xgb_baseline.py`, `training/tune_xgb_optuna.py`, and training-focused local or CI checks
+- `infra/airflow/requirements.txt`: Airflow image dependencies; includes the training/tuning stack plus Airflow-specific extras such as Feast CLI support and PostgreSQL client packages
+
 ## Current End-to-End Flow
 
 Offline and batch path:
@@ -90,8 +96,9 @@ Realtime demo path:
 Runtime entrypoint:
 - the deployed/local container starts `uvicorn serving.app:app`
 - `serving.app` owns the full serving flow: model loading, feature resolution, recommendation, and metrics
+- the canonical Feast repository for serving and training is the top-level `feature_repo/`
 - `serving/realtime_features.py` is a helper for reading realtime Redis hashes
-- `serving/realtime_app.py` is kept only as a thin compatibility shim for older imports
+- `serving/realtime_app.py` is kept only as a thin compatibility shim for older imports and is not the primary runtime module
 
 Prediction path:
 - `/predict_proba` accepts either `user_id + item_id` or a full manual feature row
@@ -164,7 +171,43 @@ python3 -m training.train_xgb_baseline
 python3 -m training.promote_model --run-id <RUN_ID_FROM_TRAINING_OUTPUT> --model-name xgb-baseline-retailrocket --artifact-path model --tracking-uri http://localhost:5000
 
 curl -X POST http://localhost:8000/reload_model
+curl -i http://localhost:8000/readyz
 ```
+
+Smallest post-promotion reload helper:
+```bash
+cd ..
+python3 scripts/promote_and_reload_model.py \
+  --run-id <RUN_ID_FROM_TRAINING_OUTPUT> \
+  --model-name xgb-baseline-retailrocket \
+  --artifact-path model \
+  --tracking-uri http://localhost:5000 \
+  --reload-url http://localhost:8000/reload_model
+```
+
+This helper keeps promotion and serving loosely coupled:
+- it runs `python3 -m training.promote_model`
+- then it calls `POST /reload_model`
+- it exits nonzero if promotion fails or if the API reload call fails
+
+Readiness notes:
+- `GET /healthz` is liveness only and returns `200` when the FastAPI process is up
+- Docker Compose now uses `GET /readyz` for the API healthcheck
+- `GET /readyz` returns non-200 until the model is actually loaded, so the `api` container can stay `unhealthy` after startup until you promote a model and call `/reload_model`
+
+Airflow reset and startup notes:
+- Airflow metadata uses its own PostgreSQL database: `postgresql+psycopg2://airflow:airflow@postgres:5432/airflow`
+- If your `pgdata` volume was created before `infra/postgres/init/01-create-airflow-db.sql` existed, the `airflow` role/database will not be created retroactively. Reset the local Postgres volume once before restarting Airflow:
+
+```bash
+cd infra
+docker compose down -v postgres airflow
+docker volume rm infra_pgdata infra_airflow_home 2>/dev/null || true
+docker compose up -d --build postgres airflow
+docker compose logs -f airflow
+```
+
+- The Airflow container now waits for DNS resolution and a real connection to the dedicated `airflow` database before running `airflow db migrate` and `airflow standalone`.
 
 Optional realtime demo:
 ```bash

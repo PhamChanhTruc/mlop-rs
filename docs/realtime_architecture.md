@@ -15,7 +15,8 @@ Files involved:
 - `streaming/schema.py`: shared event schema and validation
 - `streaming/flink/realtime_feature_job.py`: consumes Kafka events and updates Redis hashes
 - `serving/realtime_features.py`: reads Redis hashes into model feature rows
-- `serving/realtime_app.py`: prefers realtime Redis features during inference
+- `serving/app.py`: runtime FastAPI entrypoint that prefers realtime Redis features during inference
+- `serving/realtime_app.py`: compatibility shim for older imports that now re-exports `serving.app:app`
 
 ## What The Processor Actually Does
 
@@ -40,7 +41,13 @@ The repository uses Feast + Redis for the batch-built online feature store.
 The realtime path is related but not identical:
 - Feast materialization populates Redis from offline-generated parquet sources
 - the realtime processor writes Redis hashes directly for low-latency demo updates
-- `serving/realtime_app.py` tries realtime Redis first, then Feast online lookup, then manual payload fallback
+- `serving.app` tries realtime Redis first, then Feast online lookup, then manual payload fallback
+
+Canonical runtime structure:
+- the canonical Feast repository is the top-level `feature_repo/`
+- the serving container copies that root `feature_repo/` to `/app/feature_repo`
+- the deployed and local API entrypoint is `serving.app:app`
+- `serving/realtime_app.py` remains only as a thin compatibility shim and should not be described as a separate serving implementation
 
 So the realtime demo complements Feast-based online serving, but it is not a full Feast streaming ingestion pipeline.
 
