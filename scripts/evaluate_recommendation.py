@@ -31,7 +31,11 @@ DEFAULT_ARTIFACT_PATH = "model"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline evaluation for the retrieval + ranking recommendation pipeline.",
+        description=(
+            "Offline evaluation for the retrieval + ranking recommendation pipeline. "
+            "This script intentionally reads processed events parquet to rebuild point-in-time "
+            "history for the evaluation cutoff; the serving API uses a precomputed candidate artifact instead."
+        ),
     )
     parser.add_argument(
         "--events-path",

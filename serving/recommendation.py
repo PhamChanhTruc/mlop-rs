@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gzip
+import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -14,6 +16,36 @@ POPULAR_EVENT_WEIGHTS = {
     "transaction": 5.0,
 }
 GENERATED_REQUEST_MODE = "generated_recent_and_popular"
+RECOMMENDATION_ARTIFACT_VERSION = 1
+DEFAULT_RECOMMENDATION_ARTIFACT_PATH = Path("data/processed/recommendation_candidates.json.gz")
+
+
+def _open_json_artifact(path: Path, mode: str):
+    if path.suffix == ".gz":
+        return gzip.open(path, mode, encoding="utf-8")
+    return path.open(mode, encoding="utf-8")
+
+
+def resolve_recommendation_artifact_path(configured_path: str) -> Path:
+    candidates = []
+    for path in [
+        Path(configured_path),
+        DEFAULT_RECOMMENDATION_ARTIFACT_PATH,
+        Path("data/processed/recommendation_candidates.json"),
+    ]:
+        if path not in candidates:
+            candidates.append(path)
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    checked = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "Recommendation candidate artifact not found. "
+        f"Checked: {checked}. "
+        "Build it with `python data/scripts/build_recommendation_candidates.py`."
+    )
 
 
 def resolve_recommendation_events_path(configured_path: str) -> Path:
@@ -145,11 +177,15 @@ def _optional_float(value: object) -> Optional[float]:
 
 @dataclass(slots=True)
 class CandidateGenerator:
-    events_path: Path
+    source_path: Path
     user_recent_items: Dict[int, List[int]]
     popular_items: List[int]
     candidate_pool_multiplier: int = 10
     min_candidate_pool_size: int = 50
+
+    @property
+    def events_path(self) -> Path:
+        return self.source_path
 
     @classmethod
     def from_events(
@@ -187,7 +223,7 @@ class CandidateGenerator:
         )
 
         return cls(
-            events_path=events_path or Path("<in_memory_events>"),
+            source_path=events_path or Path("<in_memory_events>"),
             user_recent_items=user_recent_items,
             popular_items=[int(item_id) for item_id in popular_items],
             candidate_pool_multiplier=int(candidate_pool_multiplier),
@@ -215,6 +251,65 @@ class CandidateGenerator:
             candidate_pool_multiplier=candidate_pool_multiplier,
             min_candidate_pool_size=min_candidate_pool_size,
         )
+
+    @classmethod
+    def from_artifact(cls, artifact_path: Path) -> "CandidateGenerator":
+        with _open_json_artifact(artifact_path, "rt") as handle:
+            payload = json.load(handle)
+
+        artifact_version = int(payload.get("artifact_version", 0))
+        if artifact_version != RECOMMENDATION_ARTIFACT_VERSION:
+            raise ValueError(
+                f"Unsupported recommendation candidate artifact version {artifact_version} in {artifact_path}"
+            )
+
+        raw_user_recent_items = payload.get("user_recent_items")
+        if raw_user_recent_items is None:
+            raise ValueError(f"Artifact {artifact_path} is missing user_recent_items")
+
+        user_recent_items: Dict[int, List[int]] = {}
+        if isinstance(raw_user_recent_items, dict):
+            for user_id, item_ids in raw_user_recent_items.items():
+                user_recent_items[int(user_id)] = [int(item_id) for item_id in item_ids]
+        else:
+            for row in raw_user_recent_items:
+                user_recent_items[int(row["user_id"])] = [int(item_id) for item_id in row["item_ids"]]
+
+        popular_items = [int(item_id) for item_id in payload.get("popular_items", [])]
+        if not popular_items:
+            raise ValueError(f"Artifact {artifact_path} is missing popular_items")
+
+        return cls(
+            source_path=artifact_path,
+            user_recent_items=user_recent_items,
+            popular_items=popular_items,
+            candidate_pool_multiplier=int(payload.get("candidate_pool_multiplier", 10)),
+            min_candidate_pool_size=int(payload.get("min_candidate_pool_size", 50)),
+        )
+
+    def to_artifact_payload(self) -> dict:
+        user_recent_items = [
+            {
+                "user_id": int(user_id),
+                "item_ids": [int(item_id) for item_id in item_ids],
+            }
+            for user_id, item_ids in sorted(self.user_recent_items.items())
+        ]
+        return {
+            "artifact_version": RECOMMENDATION_ARTIFACT_VERSION,
+            "candidate_pool_multiplier": int(self.candidate_pool_multiplier),
+            "min_candidate_pool_size": int(self.min_candidate_pool_size),
+            "popular_items": [int(item_id) for item_id in self.popular_items],
+            "user_recent_items": user_recent_items,
+        }
+
+    def save_artifact(self, artifact_path: Path) -> Path:
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.to_artifact_payload()
+        with _open_json_artifact(artifact_path, "wt") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+        return artifact_path
 
     def candidate_pool_limit(self, top_k: int) -> int:
         return max(int(top_k) * self.candidate_pool_multiplier, self.min_candidate_pool_size)

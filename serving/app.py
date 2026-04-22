@@ -21,6 +21,7 @@ from serving.recommendation import (
     CandidateGenerator,
     RecommendationCandidate,
     resolve_recommendation_candidates,
+    resolve_recommendation_artifact_path,
     resolve_recommendation_events_path,
 )
 
@@ -39,6 +40,13 @@ MODEL_ARTIFACT_PATH = os.getenv("MODEL_ARTIFACT_PATH", "model")
 FALLBACK_TO_LATEST_RUN = os.getenv("MODEL_URI_FALLBACK_TO_LATEST_RUN", "false").lower() == "true"
 PREDICTION_THRESHOLD = float(os.getenv("PREDICTION_THRESHOLD", "0.5"))
 FEAST_REPO_PATH = os.getenv("FEAST_REPO_PATH", "/app/feature_repo")
+RECOMMENDATION_CANDIDATE_ARTIFACT_PATH = os.getenv(
+    "RECOMMENDATION_CANDIDATE_ARTIFACT_PATH",
+    "/app/data/processed/recommendation_candidates.json.gz",
+)
+RECOMMENDATION_CANDIDATE_ALLOW_PARQUET_FALLBACK = (
+    os.getenv("RECOMMENDATION_CANDIDATE_ALLOW_PARQUET_FALLBACK", "false").lower() == "true"
+)
 RECOMMENDATION_EVENTS_PATH = os.getenv(
     "RECOMMENDATION_EVENTS_PATH",
     "/app/data/processed/events_retailrocket.parquet",
@@ -233,12 +241,34 @@ def _load_realtime_feature_reader() -> None:
 def _load_candidate_generator() -> None:
     global _candidate_generator, _candidate_generator_error
     try:
-        events_path = resolve_recommendation_events_path(RECOMMENDATION_EVENTS_PATH)
-        _candidate_generator = CandidateGenerator.from_parquet(events_path)
+        artifact_path = resolve_recommendation_artifact_path(RECOMMENDATION_CANDIDATE_ARTIFACT_PATH)
+        _candidate_generator = CandidateGenerator.from_artifact(artifact_path)
         _candidate_generator_error = None
+        return
     except Exception as exc:
-        _candidate_generator = None
-        _candidate_generator_error = str(exc)
+        artifact_error = exc
+
+    if RECOMMENDATION_CANDIDATE_ALLOW_PARQUET_FALLBACK:
+        try:
+            events_path = resolve_recommendation_events_path(RECOMMENDATION_EVENTS_PATH)
+            _candidate_generator = CandidateGenerator.from_parquet(events_path)
+            _candidate_generator_error = None
+            return
+        except Exception as exc:
+            _candidate_generator = None
+            _candidate_generator_error = (
+                f"Recommendation candidate artifact load failed: {artifact_error}; "
+                f"parquet fallback also failed: {exc}"
+            )
+            return
+
+    _candidate_generator = None
+    _candidate_generator_error = (
+        f"Recommendation candidate artifact load failed: {artifact_error}. "
+        "Build it with `python data/scripts/build_recommendation_candidates.py`, "
+        "or set RECOMMENDATION_CANDIDATE_ALLOW_PARQUET_FALLBACK=true to temporarily rebuild from the "
+        "processed events parquet at startup."
+    )
 
 
 def _user_item_key(user_id: int, item_id: int) -> str:
@@ -462,6 +492,9 @@ def root() -> dict:
         "feast_loaded": _feature_store is not None,
         "realtime_feature_reader_loaded": _realtime_feature_reader is not None,
         "candidate_generation_loaded": _candidate_generator is not None,
+        "candidate_generation_source": (
+            str(_candidate_generator.source_path) if _candidate_generator is not None else None
+        ),
     }
 
 
@@ -534,6 +567,12 @@ def recommend(payload: RecommendRequest) -> dict:
         )
 
     try:
+        if (
+            payload.candidate_item_ids is None
+            and payload.candidates is None
+            and _candidate_generator is None
+        ):
+            _load_candidate_generator()
         manual_candidates = (
             [candidate.model_dump() for candidate in payload.candidates]
             if payload.candidates is not None
@@ -604,7 +643,6 @@ def reload_model() -> dict:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8")
-
 
 
 
