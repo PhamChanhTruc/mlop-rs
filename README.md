@@ -72,6 +72,72 @@ Future work:
 - `requirements-training.txt`: shared training/tuning dependencies for `training/train_xgb_baseline.py`, `training/tune_xgb_optuna.py`, and training-focused local or CI checks
 - `infra/airflow/requirements.txt`: Airflow image dependencies; includes the training/tuning stack plus Airflow-specific extras such as Feast CLI support and PostgreSQL client packages
 
+## Data Bootstrap (Fresh Clone)
+
+This repository does not commit RetailRocket raw CSVs or generated parquet outputs.
+
+For the current preprocessing and trainset flow, place the raw files under:
+- `data/raw/retailrocket/`
+
+Current raw file expectations:
+- required for `data/scripts/preprocess_retailrocket.py`: `data/raw/retailrocket/events.csv`
+- optional to keep alongside the original RetailRocket download, but not used by the current preprocess/trainset scripts:
+  - `data/raw/retailrocket/category_tree.csv`
+  - `data/raw/retailrocket/item_properties_part1.csv`
+  - `data/raw/retailrocket/item_properties_part2.csv`
+
+Stop if this fails: do not run preprocessing until the bootstrap check passes.
+
+```bash
+cd /home/truc/mlops-rs
+bash scripts/check_data_bootstrap.sh
+python3 data/scripts/preprocess_retailrocket.py
+python3 data/scripts/build_trainset_retailrocket.py
+```
+
+Expected outputs:
+- `data/processed/events_retailrocket.parquet`
+- `data/processed/dataset_retailrocket/train.parquet`
+- `data/processed/dataset_retailrocket/val.parquet`
+- `data/processed/dataset_retailrocket/test.parquet`
+
+## Feast Online Readiness (Local)
+
+The Feast repository uses `online_store.connection_string: redis:6379` in `feature_repo/feature_store.yaml`, so the build/apply/materialize flow should run inside the Docker Compose network.
+
+Minimal staged commands:
+
+```bash
+cd /home/truc/mlops-rs
+
+bash scripts/check_data_bootstrap.sh
+python3 data/scripts/preprocess_retailrocket.py
+python3 data/scripts/build_trainset_retailrocket.py
+
+cd infra
+docker compose up -d --build redis mlflow api
+cd ..
+
+bash scripts/verify_feast_online.sh
+```
+
+What `scripts/verify_feast_online.sh` does:
+1. runs `python -m feature_repo.build_online_features` inside the `api` container
+2. runs `feast apply` inside `/app/feature_repo`
+3. runs `feast materialize-incremental`
+4. verifies a real Feast online lookup from inside the Compose network
+5. calls `/predict_proba` and asserts `feature_source=feast_online` when the API has a loaded model and no realtime Redis hashes override that pair
+
+Expected pass signals:
+- `feature_repo/data/user_stats.parquet` exists
+- `feature_repo/data/item_stats.parquet` exists
+- `feature_repo/data/user_item_stats.parquet` exists
+- `feature_repo/data/registry.db` exists
+- direct Feast online lookup returns non-null feature values
+- `/predict_proba` returns `feature_source=feast_online` when the API can score requests
+
+Stop if this fails: do not claim Feast online serving is ready unless the helper completes successfully, or unless it reports only the expected “model not loaded yet” note after a successful direct Feast lookup.
+
 ## Current End-to-End Flow
 
 Offline and batch path:
