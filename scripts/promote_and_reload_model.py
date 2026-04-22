@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +26,13 @@ def parse_args() -> argparse.Namespace:
         help="MLflow tracking URI.",
     )
     parser.add_argument(
+        "--api-base-url",
+        default="http://localhost:8000",
+        help="Base serving API URL. Used with /reload_model when --reload-url is not provided.",
+    )
+    parser.add_argument(
         "--reload-url",
-        default="http://localhost:8000/reload_model",
+        default=None,
         help="Serving API reload endpoint.",
     )
     parser.add_argument(
@@ -38,6 +40,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Timeout in seconds for the reload API call.",
+    )
+    parser.add_argument(
+        "--reload-max-attempts",
+        type=int,
+        default=3,
+        help="Maximum reload attempts when the API cannot be reached.",
+    )
+    parser.add_argument(
+        "--reload-retry-delay-sec",
+        type=float,
+        default=2.0,
+        help="Delay between reload retries after connection failures.",
     )
     parser.add_argument(
         "--python-bin",
@@ -60,9 +74,20 @@ def run_promotion(args: argparse.Namespace) -> None:
         args.artifact_path,
         "--tracking-uri",
         args.tracking_uri,
+        "--reload-api",
+        "--reload-timeout-sec",
+        str(args.timeout_sec),
+        "--reload-max-attempts",
+        str(args.reload_max_attempts),
+        "--reload-retry-delay-sec",
+        str(args.reload_retry_delay_sec),
     ]
+    if args.reload_url:
+        command.extend(["--reload-url", args.reload_url])
+    elif args.api_base_url:
+        command.extend(["--api-base-url", args.api_base_url])
 
-    print("[1/2] Promoting model in MLflow...")
+    print("Promoting model and reloading the serving API...")
     result = subprocess.run(
         command,
         check=True,
@@ -75,67 +100,18 @@ def run_promotion(args: argparse.Namespace) -> None:
         print(result.stderr.strip(), file=sys.stderr)
 
 
-def call_reload(args: argparse.Namespace) -> dict:
-    print(f"[2/2] Calling reload endpoint: {args.reload_url}")
-    request = urllib.request.Request(
-        args.reload_url,
-        data=b"{}",
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    with urllib.request.urlopen(request, timeout=args.timeout_sec) as response:
-        body = response.read().decode("utf-8")
-        payload = json.loads(body) if body else {}
-        print(f"Reload HTTP {response.status}")
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return payload
-
-
 def main() -> None:
     args = parse_args()
 
     try:
         run_promotion(args)
     except subprocess.CalledProcessError as exc:
-        print("Promotion failed.", file=sys.stderr)
+        print("Promotion and reload failed.", file=sys.stderr)
         if exc.stdout:
             print(exc.stdout.strip(), file=sys.stderr)
         if exc.stderr:
             print(exc.stderr.strip(), file=sys.stderr)
         raise SystemExit(exc.returncode) from exc
-
-    try:
-        payload = call_reload(args)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        print(
-            f"Promotion succeeded, but reload failed with HTTP {exc.code} at {args.reload_url}.",
-            file=sys.stderr,
-        )
-        if body:
-            print(body, file=sys.stderr)
-        raise SystemExit(1) from exc
-    except urllib.error.URLError as exc:
-        print(
-            f"Promotion succeeded, but reload request could not reach {args.reload_url}: {exc}",
-            file=sys.stderr,
-        )
-        raise SystemExit(1) from exc
-
-    loaded_model_uri = payload.get("model_uri_loaded")
-    if payload.get("reloaded") is True:
-        print(
-            "Promotion and reload succeeded."
-            f"{f' Serving model: {loaded_model_uri}' if loaded_model_uri else ''}"
-        )
-        return
-
-    print(
-        "Promotion succeeded, but reload response did not confirm success.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
 
 
 if __name__ == "__main__":
