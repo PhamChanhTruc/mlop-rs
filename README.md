@@ -12,16 +12,17 @@ Business goal:
 
 Implemented pipeline:
 1. preprocess raw interaction events into cleaned parquet data
-2. build a leakage-aware future-purchase dataset with time-based train/validation/test splits
-3. define the canonical model feature contract in `feature_repo/`
-4. build offline feature files and materialize online features to Redis through Feast
-5. train an XGBoost baseline and optionally tune with Optuna
-6. track experiments and register/promote models with MLflow + PostgreSQL
-7. orchestrate the local pipeline with Airflow
-8. serve `/predict_proba` and `/recommend` through FastAPI
-9. expose API metrics to Prometheus and Grafana
-10. demonstrate a local realtime update path from Kafka to Redis
-11. optionally deploy the FastAPI service container to Cloud Run
+2. build a compact recommendation candidate artifact for serving-time retrieval
+3. build a leakage-aware future-purchase dataset with time-based train/validation/test splits
+4. define the canonical model feature contract in `feature_repo/`
+5. build offline feature files and materialize online features to Redis through Feast
+6. train an XGBoost baseline and optionally tune with Optuna
+7. track experiments and register/promote models with MLflow + PostgreSQL
+8. orchestrate the local pipeline with Airflow
+9. serve `/predict_proba` and `/recommend` through FastAPI
+10. expose API metrics to Prometheus and Grafana
+11. demonstrate a local realtime update path from Kafka to Redis
+12. optionally deploy the FastAPI service container to Cloud Run
 
 ## What Is Actually Done
 
@@ -92,11 +93,13 @@ Stop if this fails: do not run preprocessing until the bootstrap check passes.
 cd /home/truc/mlops-rs
 bash scripts/check_data_bootstrap.sh
 python3 data/scripts/preprocess_retailrocket.py
+python3 data/scripts/build_recommendation_candidates.py
 python3 data/scripts/build_trainset_retailrocket.py
 ```
 
 Expected outputs:
 - `data/processed/events_retailrocket.parquet`
+- `data/processed/recommendation_candidates.json.gz`
 - `data/processed/dataset_retailrocket/train.parquet`
 - `data/processed/dataset_retailrocket/val.parquet`
 - `data/processed/dataset_retailrocket/test.parquet`
@@ -142,13 +145,14 @@ Stop if this fails: do not claim Feast online serving is ready unless the helper
 
 Offline and batch path:
 1. `data/scripts/preprocess_retailrocket.py` cleans raw events into `data/processed/events_retailrocket.parquet`
-2. `data/scripts/build_trainset_retailrocket.py` builds candidate rows, labels, and time-based splits
-3. `feature_repo/build_online_features.py` derives online feature source files from processed events
-4. `feast apply` and `feast materialize-incremental` load those features into Redis
-5. `training/train_xgb_baseline.py` trains the baseline model and logs to MLflow
-6. `training/tune_xgb_optuna.py` optionally tunes and logs a stronger model
-7. `training/promote_model.py` registers and promotes a selected model in MLflow
-8. `serving.app:app` loads the promoted model for inference
+2. `data/scripts/build_recommendation_candidates.py` creates `data/processed/recommendation_candidates.json.gz` so serving can load retrieval candidates without scanning the full events parquet at startup
+3. `data/scripts/build_trainset_retailrocket.py` builds candidate rows, labels, and time-based splits
+4. `feature_repo/build_online_features.py` derives online feature source files from processed events
+5. `feast apply` and `feast materialize-incremental` load those features into Redis
+6. `training/train_xgb_baseline.py` trains the baseline model and logs to MLflow
+7. `training/tune_xgb_optuna.py` optionally tunes and logs a stronger model
+8. `training/promote_model.py` registers and promotes a selected model in MLflow
+9. `serving.app:app` loads the promoted model for inference
 
 Realtime demo path:
 1. `streaming/producer/simulate_events.py` publishes demo user events to Kafka
@@ -183,12 +187,28 @@ Recommendation path:
   - explicit `candidate_item_ids`
   - explicit per-candidate feature payloads
   - generated candidates for a known `user_id`
-- generated candidates come from `serving/recommendation.py`
+- generated candidates come from a compact precomputed artifact built by `data/scripts/build_recommendation_candidates.py` and loaded by `serving/recommendation.py`
 - retrieval uses two simple sources that are easy to explain in a thesis defense:
   - the user's most recent unique interacted items
   - globally popular items as fallback or cold-start padding
 - each candidate is then ranked by the same purchase-probability model used by `/predict_proba`
 - manual candidate modes remain available as fallback when the caller wants to control the candidate set directly
+
+Recommendation candidate artifact details:
+- default artifact path: `data/processed/recommendation_candidates.json.gz`
+- local build command:
+
+```bash
+cd /home/truc/mlops-rs
+python3 data/scripts/build_recommendation_candidates.py
+```
+
+- serving loads this compact artifact at startup instead of scanning the full processed events parquet
+- if the artifact is missing, generated-candidate `/recommend` requests fail with an actionable message telling you to run `python data/scripts/build_recommendation_candidates.py`
+- temporary compatibility fallback exists via `RECOMMENDATION_CANDIDATE_ALLOW_PARQUET_FALLBACK=true`, but this re-enables the slower startup-time parquet scan and should be treated as a transition/debug option rather than the normal thesis-demo path
+- optional serving env vars:
+  - `RECOMMENDATION_CANDIDATE_ARTIFACT_PATH`
+  - `RECOMMENDATION_CANDIDATE_ALLOW_PARQUET_FALLBACK`
 
 ## Realtime Path
 
@@ -225,6 +245,7 @@ docker compose up -d --build
 
 cd ..
 python3 data/scripts/preprocess_retailrocket.py
+python3 data/scripts/build_recommendation_candidates.py
 python3 data/scripts/build_trainset_retailrocket.py
 
 cd infra
@@ -234,13 +255,41 @@ docker compose exec api bash -lc "cd /app/feature_repo && feast materialize-incr
 
 cd ..
 python3 -m training.train_xgb_baseline
-python3 -m training.promote_model --run-id <RUN_ID_FROM_TRAINING_OUTPUT> --model-name xgb-baseline-retailrocket --artifact-path model --tracking-uri http://localhost:5000
+python3 -m training.promote_model \
+  --run-id <RUN_ID_FROM_TRAINING_OUTPUT> \
+  --model-name xgb-baseline-retailrocket \
+  --artifact-path model \
+  --tracking-uri http://localhost:5000 \
+  --reload-api \
+  --api-base-url http://localhost:8000
 
-curl -X POST http://localhost:8000/reload_model
 curl -i http://localhost:8000/readyz
 ```
 
-Smallest post-promotion reload helper:
+Automatic post-promotion reload:
+- `training/promote_model.py` can now promote the model and then call `POST /reload_model` in one step
+- direct CLI flags:
+  - `--reload-api`
+  - `--api-base-url http://localhost:8000`
+  - `--reload-url http://localhost:8000/reload_model`
+  - `--reload-timeout-sec`
+  - `--reload-max-attempts`
+  - `--reload-retry-delay-sec`
+- equivalent environment variables:
+  - `PROMOTE_RELOAD_API`
+  - `PROMOTE_API_BASE_URL`
+  - `PROMOTE_RELOAD_URL`
+  - `PROMOTE_RELOAD_TIMEOUT_SEC`
+  - `PROMOTE_RELOAD_MAX_ATTEMPTS`
+  - `PROMOTE_RELOAD_RETRY_DELAY_SEC`
+- the local Airflow DAG uses the same promotion command and can reload the API automatically after promotion through:
+  - `AIRFLOW_RELOAD_API_AFTER_PROMOTION`
+  - `AIRFLOW_API_BASE_URL`
+  - `AIRFLOW_API_RELOAD_URL`
+- reload only runs after promotion succeeds; reload failures surface clearly and keep the overall command nonzero
+- manual `curl -X POST http://localhost:8000/reload_model` still works if you want to trigger reload explicitly
+
+Smallest helper command:
 ```bash
 cd ..
 python3 scripts/promote_and_reload_model.py \
@@ -253,7 +302,7 @@ python3 scripts/promote_and_reload_model.py \
 
 This helper keeps promotion and serving loosely coupled:
 - it runs `python3 -m training.promote_model`
-- then it calls `POST /reload_model`
+- it enables the built-in reload step in `training/promote_model.py`
 - it exits nonzero if promotion fails or if the API reload call fails
 
 Readiness notes:
@@ -294,6 +343,10 @@ python3 scripts/evaluate_recommendation.py \
   --ks 5,10,20
 ```
 
+The evaluation helper still reads the processed events parquet on purpose so it can reconstruct point-in-time
+history before the test cutoff. The serving API no longer needs that full parquet scan at startup when the
+recommendation candidate artifact has been built.
+
 ## Minimal Cloud Deployment Path
 
 Implemented cloud path:
@@ -323,6 +376,34 @@ Implemented workflows:
 - `deploy-cloud-run.yml`: manual Cloud Run deployment workflow
 
 This is enough to support a thesis demo and basic reproducibility, but it is not yet a full multi-environment CI/CD system.
+
+Manual training workflow notes:
+- `.github/workflows/manual-train.yml` does not assume gitignored RetailRocket raw data is already present in the checkout
+- raw RetailRocket CSVs are not committed to git; the workflow bootstraps them from a configured download source
+- required repository secret:
+  - `RETAILROCKET_DATA_URL`
+- optional repository secret:
+  - `RETAILROCKET_SHA256`
+- workflow sequence:
+  1. check out the repo
+  2. install Python and training dependencies
+  3. create the expected raw/processed data directories
+  4. download/bootstrap the RetailRocket dataset into `data/raw/retailrocket/`
+  5. verify that `data/raw/retailrocket/events.csv` exists and passes the bootstrap check
+  6. run `python data/scripts/preprocess_retailrocket.py`
+  7. run `python data/scripts/build_trainset_retailrocket.py`
+  8. train the baseline model
+  9. optionally run Optuna tuning
+  10. upload `mlruns/` and `data/processed/` as workflow artifacts
+- accepted dataset inputs for `RETAILROCKET_DATA_URL`:
+  - a direct download URL for `events.csv`
+  - a zip archive containing `events.csv`
+- expected clear failure modes:
+  - `RETAILROCKET_DATA_URL` is missing
+  - the download fails
+  - `RETAILROCKET_SHA256` is set but does not match the downloaded asset
+  - the archive/download completes but `events.csv` is not found
+  - the bootstrap check fails because `events.csv` is malformed or missing required columns
 
 ## Monitoring
 
