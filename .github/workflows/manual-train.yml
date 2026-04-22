@@ -38,12 +38,31 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential
+          sudo apt-get install -y --no-install-recommends build-essential curl
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-training.txt
+
+      - name: Create data directories
+        run: |
+          mkdir -p data/raw/retailrocket data/processed
+
+      - name: Bootstrap RetailRocket raw dataset
+        env:
+          RETAILROCKET_DATA_URL: ${{ secrets.RETAILROCKET_DATA_URL }}
+          RETAILROCKET_SHA256: ${{ secrets.RETAILROCKET_SHA256 }}
+        run: |
+          bash scripts/bootstrap_retailrocket_ci.sh
+
+      - name: Verify data bootstrap
+        run: |
+          if [[ -f scripts/check_data_bootstrap.sh ]]; then
+            bash scripts/check_data_bootstrap.sh
+          else
+            echo "scripts/check_data_bootstrap.sh not found; skipping bootstrap verification."
+          fi
 
       - name: Rebuild processed data and trainset
         run: |
@@ -70,7 +89,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: processed-data
-          path: |
-            data/processed/events_retailrocket.parquet
-            data/processed/dataset_retailrocket
+          path: data/processed/
           if-no-files-found: error
